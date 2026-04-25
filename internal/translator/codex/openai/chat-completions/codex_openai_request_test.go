@@ -176,6 +176,38 @@ func TestToolCallWithContent(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIRequestToCodex_PreservesPriorityServiceTier(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.4(high)",
+		"messages": [
+			{"role": "user", "content": "hi"}
+		],
+		"service_tier": "priority"
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4(high)", input, true)
+
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("expected service_tier=priority, got %q; out=%s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIRequestToCodex_DropsNonPriorityServiceTier(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.4(high)",
+		"messages": [
+			{"role": "user", "content": "hi"}
+		],
+		"service_tier": "default"
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4(high)", input, true)
+
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("expected non-priority service_tier to be omitted, got out=%s", string(out))
+	}
+}
+
 // Parallel tool calls: assistant invokes 3 tools at once, all call_ids
 // and outputs must be translated and paired correctly.
 func TestMultipleToolCalls(t *testing.T) {

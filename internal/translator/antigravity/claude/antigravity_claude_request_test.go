@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	internalsignature "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	log "github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/tidwall/gjson"
@@ -1713,6 +1714,58 @@ func TestConvertClaudeRequestToAntigravity_ToolUse(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_ToolUsePreservesPresentNonObjectInput(t *testing.T) {
+	tests := []struct {
+		name             string
+		inputJSON        string
+		wantArgs         string
+		wantFunctionCall bool
+	}{
+		{name: "plain string", inputJSON: `"plain"`, wantArgs: `"plain"`, wantFunctionCall: true},
+		{name: "array", inputJSON: `[1,"two"]`, wantArgs: `[1,"two"]`, wantFunctionCall: true},
+		{name: "number", inputJSON: `42`, wantArgs: `42`, wantFunctionCall: true},
+		{name: "boolean", inputJSON: `true`, wantArgs: `true`, wantFunctionCall: true},
+		{name: "null", inputJSON: `null`, wantArgs: `{}`, wantFunctionCall: true},
+		{name: "missing", wantFunctionCall: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inputField := ""
+			if tc.inputJSON != "" {
+				inputField = fmt.Sprintf(`,"input":%s`, tc.inputJSON)
+			}
+			inputJSON := []byte(fmt.Sprintf(`{
+				"model": "claude-sonnet-4-5",
+				"messages": [{
+					"role": "assistant",
+					"content": [{
+						"type": "tool_use",
+						"id": "call_123",
+						"name": "run"%s
+					}]
+				}]
+			}`, inputField))
+
+			output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+			part := gjson.GetBytes(output, "request.contents.0.parts.0")
+			functionCall := part.Get("functionCall")
+			if tc.wantFunctionCall {
+				if !functionCall.Exists() {
+					t.Fatalf("functionCall should exist, output: %s", output)
+				}
+				if got := functionCall.Get("args").Raw; got != tc.wantArgs {
+					t.Fatalf("functionCall.args = %q, want %q; output: %s", got, tc.wantArgs, output)
+				}
+				return
+			}
+			if functionCall.Exists() {
+				t.Fatalf("missing input should not create functionCall, output: %s", output)
+			}
+		})
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_ToolUse_DropsInvalidThoughtSignatureOnly(t *testing.T) {
 	hook := newSignatureDebugHook(t)
 	rawSignature := "skip_thought_signature_validator"
@@ -1952,6 +2005,53 @@ func TestConvertClaudeRequestToAntigravity_ReorderParallelFunctionCalls(t *testi
 	}
 	if parts[3].Get("functionCall.name").String() != "Read" || parts[3].Get("functionCall.id").String() != "call_2" {
 		t.Errorf("Expected fc2 fourth, got %s", parts[3].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_AlignsPermutedParallelToolResultsWithMixedText(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gemini-3.7-flash-high",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"call_1620603","name":"Read","input":{"file_path":"/tmp/1"}},
+				{"type":"tool_use","id":"call_1620604","name":"Read","input":{"file_path":"/tmp/2"}},
+				{"type":"tool_use","id":"call_1620605","name":"Read","input":{"file_path":"/tmp/3"}},
+				{"type":"tool_use","id":"call_1620606","name":"Read","input":{"file_path":"/tmp/4"}},
+				{"type":"tool_use","id":"call_1620607","name":"Read","input":{"file_path":"/tmp/5"}},
+				{"type":"tool_use","id":"call_1620608","name":"Read","input":{"file_path":"/tmp/6"}}
+			]},
+			{"role":"user","content":[
+				{"type":"text","text":"Tool results follow."},
+				{"type":"tool_result","tool_use_id":"call_1620608","content":"six"},
+				{"type":"tool_result","tool_use_id":"call_1620605","content":"three"},
+				{"type":"tool_result","tool_use_id":"call_1620603","content":"one"},
+				{"type":"text","text":"Continue after reading."},
+				{"type":"tool_result","tool_use_id":"call_1620607","content":"five"},
+				{"type":"tool_result","tool_use_id":"call_1620604","content":"two"},
+				{"type":"tool_result","tool_use_id":"call_1620606","content":"four"}
+			]}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("gemini-3.7-flash-high", inputJSON, false)
+	parts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	if len(parts) != 8 {
+		t.Fatalf("parts = %d, want six responses followed by two text parts; output=%s", len(parts), output)
+	}
+	for index := 0; index < 6; index++ {
+		wantID := fmt.Sprintf("call_162060%d", index+3)
+		if gotID := parts[index].Get("functionResponse.id").String(); gotID != wantID {
+			t.Fatalf("functionResponse[%d].id = %q, want %q; output=%s", index, gotID, wantID, output)
+		}
+	}
+	if got := parts[6].Get("text").String(); got != "Tool results follow." {
+		t.Fatalf("first trailing text = %q; output=%s", got, output)
+	}
+	if got := parts[7].Get("text").String(); got != "Continue after reading." {
+		t.Fatalf("second trailing text = %q; output=%s", got, output)
+	}
+	if errPairing := internalsignature.ValidateGeminiFunctionCallPairing(output); errPairing != nil {
+		t.Fatalf("translated parallel tool history is invalid: %v; output=%s", errPairing, output)
 	}
 }
 
@@ -2238,8 +2338,8 @@ func TestConvertClaudeRequestToAntigravity_ThinkingConfig(t *testing.T) {
 		if thinkingConfig.Get("thinkingBudget").Int() != 8000 {
 			t.Errorf("Expected thinkingBudget 8000, got %d", thinkingConfig.Get("thinkingBudget").Int())
 		}
-		if !thinkingConfig.Get("includeThoughts").Bool() {
-			t.Error("includeThoughts should be true")
+		if thinkingConfig.Get("includeThoughts").Exists() {
+			t.Error("includeThoughts should be absent without explicit Claude display intent")
 		}
 	} else {
 		t.Log("thinkingConfig not present - model may not be registered in test registry")
@@ -3311,5 +3411,61 @@ func TestConvertClaudeRequestToAntigravity_ToolAndThinking_NoExistingSystem(t *t
 	}
 	if !found {
 		t.Errorf("Interleaved thinking hint should be in created systemInstruction, got: %v", sysInstruction.Raw)
+	}
+}
+
+// TestConvertClaudeRequestToAntigravityStripsPropertyNames covers the reported ingress route: a
+// Claude Messages request carrying MCP-style tool schemas. The private Gemini backend rejects the
+// standard JSON Schema keyword "propertyNames" with an unknown-field 400 before inference, so it
+// must not survive translation. Both reported nestings are exercised, including the one where the
+// keyword sits inside a property that is itself named "properties".
+func TestConvertClaudeRequestToAntigravityStripsPropertyNames(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [
+			{
+				"name": "notion-create-pages",
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"records": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {"name": {"type": "string"}},
+								"propertyNames": {"type": "string"}
+							}
+						}
+					}
+				}
+			},
+			{
+				"name": "notion-update-page",
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"properties": {"type": "object", "propertyNames": {"type": "string"}}
+					}
+				}
+			}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+
+	decls := gjson.GetBytes(output, "request.tools.0.functionDeclarations")
+	if !decls.IsArray() || len(decls.Array()) != 2 {
+		t.Fatalf("expected two function declarations, got: %s", decls.Raw)
+	}
+	if strings.Contains(decls.Raw, `"propertyNames"`) {
+		t.Errorf("propertyNames survived translation: %s", decls.Raw)
+	}
+	// The declarations must still be usable, not emptied out by the cleaning.
+	if !decls.Get("0.parametersJsonSchema.properties.records.items.properties.name").Exists() {
+		t.Errorf("array item property was lost: %s", decls.Get("0").Raw)
+	}
+	if !decls.Get("1.parametersJsonSchema.properties.properties").Exists() {
+		t.Errorf("property named properties was lost: %s", decls.Get("1").Raw)
 	}
 }

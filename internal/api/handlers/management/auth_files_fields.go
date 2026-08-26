@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -168,6 +169,7 @@ func setSourceAuthFileDisabled(path string, disabled bool) error {
 	if metadata == nil {
 		metadata = make(map[string]any)
 	}
+	coreauth.NormalizeCredentialMetadata(metadata)
 	metadata["disabled"] = disabled
 	raw, errMarshal := json.Marshal(metadata)
 	if errMarshal != nil {
@@ -229,6 +231,22 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 	delete(req, "name")
+	var errNormalize error
+	req, errNormalize = normalizeAuthFilePatchFields(req)
+	if errNormalize != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
+		return
+	}
+	requestRetryPatch, errRequestRetry := decodeAuthFileRequestRetryPatch(req)
+	if errRequestRetry != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRequestRetry.Error()})
+		return
+	}
+	for key := range req {
+		if strings.TrimSpace(key) == "request_retry" {
+			delete(req, key)
+		}
+	}
 
 	ctx := c.Request.Context()
 
@@ -254,6 +272,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 		return
 	}
+	coreauth.NormalizeCredentialMetadata(targetAuth.Metadata)
 
 	changed := false
 	touchedRoots := make(map[string]struct{}, len(req))
@@ -272,7 +291,25 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			targetAuth.Metadata = make(map[string]any)
 		}
 
-		if fieldPath == "headers" {
+		if fieldPath == coreauth.AttributeWeight {
+			if value == nil {
+				delete(targetAuth.Metadata, coreauth.AttributeWeight)
+			} else {
+				if _, okNumber := value.(json.Number); !okNumber {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "weight must be an integer"})
+					return
+				}
+				weight, errWeight := credentialweight.ParseValue(value)
+				if errWeight != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": errWeight.Error()})
+					return
+				}
+				targetAuth.Metadata[coreauth.AttributeWeight] = weight
+			}
+		} else if rootAuthFileField(fieldPath) == coreauth.AttributeWeight {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "weight does not support nested fields"})
+			return
+		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
@@ -280,6 +317,17 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		}
 		if root := rootAuthFileField(fieldPath); root != "" {
 			touchedRoots[root] = struct{}{}
+		}
+		changed = true
+	}
+	if requestRetryPatch.Set {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if requestRetryPatch.Value == nil {
+			delete(targetAuth.Metadata, "request_retry")
+		} else {
+			targetAuth.Metadata["request_retry"] = *requestRetryPatch.Value
 		}
 		changed = true
 	}
@@ -310,6 +358,84 @@ func decodeAuthFileFieldValue(raw json.RawMessage) (any, error) {
 		return nil, err
 	}
 	return value, nil
+}
+
+type authFileRequestRetryPatch struct {
+	Set   bool
+	Value *int
+}
+
+func normalizeAuthFilePatchFields(fields map[string]json.RawMessage) (map[string]json.RawMessage, error) {
+	normalized := make(map[string]json.RawMessage, len(fields))
+	originalNames := make(map[string]string, len(fields))
+	canonicalNames := make(map[string]bool, len(fields))
+	for key, value := range fields {
+		parts := strings.Split(strings.TrimSpace(key), ".")
+		for index := range parts {
+			parts[index] = strings.TrimSpace(parts[index])
+		}
+		originalRoot := parts[0]
+		parts[0] = coreauth.CanonicalCredentialMetadataKey(originalRoot)
+		canonicalPath := strings.Join(parts, ".")
+		if original, exists := originalNames[canonicalPath]; exists {
+			currentCanonical := originalRoot == parts[0]
+			if canonicalNames[canonicalPath] != currentCanonical {
+				if currentCanonical {
+					normalized[canonicalPath] = value
+					originalNames[canonicalPath] = key
+					canonicalNames[canonicalPath] = true
+				}
+				continue
+			}
+			return nil, fmt.Errorf("auth file fields %q and %q refer to the same field", original, key)
+		}
+		normalized[canonicalPath] = value
+		originalNames[canonicalPath] = key
+		canonicalNames[canonicalPath] = originalRoot == parts[0]
+	}
+	return normalized, nil
+}
+
+func decodeAuthFileRequestRetryPatch(fields map[string]json.RawMessage) (authFileRequestRetryPatch, error) {
+	var raw json.RawMessage
+	found := false
+	for key, value := range fields {
+		fieldPath := strings.TrimSpace(key)
+		fieldRoot := rootAuthFileField(fieldPath)
+		if fieldRoot == "request_retry" && fieldPath != fieldRoot {
+			return authFileRequestRetryPatch{}, fmt.Errorf("request_retry does not support nested fields")
+		}
+		if fieldPath == "request_retry" {
+			found = true
+			raw = value
+		}
+	}
+	if !found {
+		return authFileRequestRetryPatch{}, nil
+	}
+	value, errDecode := decodeAuthFileFieldValue(raw)
+	if errDecode != nil {
+		return authFileRequestRetryPatch{}, fmt.Errorf("request_retry must be an integer or null")
+	}
+	if value == nil {
+		return authFileRequestRetryPatch{Set: true}, nil
+	}
+	number, okNumber := value.(json.Number)
+	if !okNumber {
+		return authFileRequestRetryPatch{}, fmt.Errorf("request_retry must be an integer or null")
+	}
+	parsed, errInt := number.Int64()
+	if errInt != nil {
+		return authFileRequestRetryPatch{}, fmt.Errorf("request_retry must be an integer or null")
+	}
+	normalized := int(parsed)
+	if int64(normalized) != parsed {
+		return authFileRequestRetryPatch{}, fmt.Errorf("request_retry must be an integer or null")
+	}
+	if normalized < 0 {
+		return authFileRequestRetryPatch{Set: true}, nil
+	}
+	return authFileRequestRetryPatch{Set: true, Value: &normalized}, nil
 }
 
 func rootAuthFileField(path string) string {
@@ -429,6 +555,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["priority"]; ok {
 		syncAuthFilePriorityAttribute(auth)
 	}
+	if _, ok := touchedRoots[coreauth.AttributeWeight]; ok {
+		syncAuthFileWeightAttribute(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncAuthFileNoteAttribute(auth)
 	}
@@ -474,6 +603,21 @@ func syncAuthFilePriorityAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+func syncAuthFileWeightAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	weight, errWeight := credentialweight.ParseValue(auth.Metadata[coreauth.AttributeWeight])
+	if errWeight != nil {
+		delete(auth.Attributes, coreauth.AttributeWeight)
+		return
+	}
+	auth.Attributes[coreauth.AttributeWeight] = strconv.FormatInt(weight, 10)
 }
 
 func authFileIntValue(value any) (int, bool) {
@@ -658,10 +802,48 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	return store
 }
 
+func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
+	if h == nil || record == nil {
+		return
+	}
+	var existingMap map[string]any
+
+	if h.cfg != nil && strings.TrimSpace(h.cfg.AuthDir) != "" {
+		targetFile := record.FileName
+		if targetFile == "" {
+			targetFile = record.ID
+		}
+		if targetFile != "" {
+			fullPath := filepath.Join(h.cfg.AuthDir, targetFile)
+			if raw, errRead := os.ReadFile(fullPath); errRead == nil && len(raw) > 0 {
+				_ = json.Unmarshal(raw, &existingMap)
+			}
+		}
+	}
+
+	if existingMap == nil && h.authManager != nil {
+		if existing, ok := h.authManager.GetByID(record.ID); ok && existing != nil && existing.Metadata != nil {
+			existingMap = existing.Metadata
+		} else {
+			for _, auth := range h.authManager.List() {
+				if auth != nil && auth.FileName == record.FileName && auth.Metadata != nil {
+					existingMap = auth.Metadata
+					break
+				}
+			}
+		}
+	}
+
+	if len(existingMap) > 0 {
+		coreauth.MergeExistingAuthMetadata(record, existingMap)
+	}
+}
+
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	h.mergeExistingAuthFileMetadata(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
